@@ -8,19 +8,37 @@ import numpy as np
 
 # Dummy GEMM model: y = x @ W
 def forward(params, x):
-    # h = x @ params['W1']
-    # h = jax.nn.relu(h)
-    # return h @ params['W2']
+    # h = x @ params['W1'].astype(jnp.bfloat16)
+    # h = jax.nn.relu(h).astype(jnp.bfloat16)
+    # return h @ params['W2'].astype(jnp.bfloat16)
     return x @ params['W1'].astype(jnp.bfloat16)
 
 def loss_fn(params, x, y_true):
     y_pred = forward(params, x)
     return jnp.mean((y_pred - y_true) ** 2)
 
-def create_train_step(optimizer):
+def create_train_step(optimizer, grad_accum_steps=1):
     def train_step(params, opt_state, x, y):
-        loss, grads = value_and_grad(loss_fn)(params, x, y)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
+        # Split x and y into microbatches
+        microbatch_size = x.shape[0] // grad_accum_steps
+        grads_accum = None
+        loss_accum = 0.0
+
+        for i in range(grad_accum_steps):
+            x_mb = x[i * microbatch_size : (i + 1) * microbatch_size]
+            y_mb = y[i * microbatch_size : (i + 1) * microbatch_size]
+            loss, grads = jax.value_and_grad(loss_fn)(params, x_mb, y_mb)
+            if grads_accum is None:
+                grads_accum = grads
+            else:
+                grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads_accum, grads)
+            loss_accum += loss
+
+        # Average gradients and loss
+        grads_accum = jax.tree_util.tree_map(lambda a: a / grad_accum_steps, grads_accum)
+        loss_accum = loss_accum / grad_accum_steps
+
+        updates, opt_state = optimizer.update(grads_accum, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         return new_params, opt_state, loss
     return train_step
@@ -70,7 +88,7 @@ def test_gemm_training(sharding_mode="dp"):
         # pjit version of train_step
         @pjit.pjit
         def step_fn(params, opt_state, x, y):
-            return create_train_step(optimizer)(params, opt_state, x, y)
+            return create_train_step(optimizer, grad_accum_steps=4)(params, opt_state, x, y)
 
         # Shard inputs and params
         params = jax.device_put(params, jax.sharding.NamedSharding(mesh, param_pspec))
@@ -85,5 +103,5 @@ def test_gemm_training(sharding_mode="dp"):
             print(f"[{sharding_mode}] Step {i}, Loss: {loss_float:.4f}")
 
 if __name__ == "__main__":
-    test_gemm_training("dp")    # Run with data parallel
-    # test_gemm_training("fsdp")  # Run with fully sharded data parallel
+    # test_gemm_training("dp")    # Run with data parallel
+    test_gemm_training("fsdp")  # Run with fully sharded data parallel
