@@ -8,9 +8,10 @@ import numpy as np
 
 # Dummy GEMM model: y = x @ W
 def forward(params, x):
-    h = x @ params['W1']
-    h = jax.nn.relu(h)
-    return h @ params['W2']
+    # h = x @ params['W1']
+    # h = jax.nn.relu(h)
+    # return h @ params['W2']
+    return x @ params['W1'].astype(jnp.bfloat16)
 
 def loss_fn(params, x, y_true):
     y_pred = forward(params, x)
@@ -34,16 +35,17 @@ def test_gemm_training(sharding_mode="dp"):
     # Data
     key = random.PRNGKey(0)
     target_params = 0.5
-    x = random.normal(key, (batch_size, in_dim))
-    y = random.normal(key, (batch_size, out_dim))
+    x = random.normal(key, (batch_size, in_dim), dtype=jnp.bfloat16)
+    y = random.normal(key, (batch_size, out_dim), dtype=jnp.bfloat16)
     # y = x * target_params
     print("x shape: ", x.shape)
     print("y shape: ", y.shape)
 
     # Params
     params = {
-        'W1': random.normal(key, (in_dim, hidden_dim)),  
-        'W2': random.normal(key, (hidden_dim, out_dim))
+        # 'W1': random.normal(key, (in_dim, hidden_dim), dtype=jnp.float32),  
+        # 'W2': random.normal(key, (hidden_dim, out_dim), dtype=jnp.float32)
+        'W1': random.normal(key, (in_dim, out_dim), dtype=jnp.float32),  
     }
 
     # Optimizer
@@ -78,7 +80,9 @@ def test_gemm_training(sharding_mode="dp"):
 
         for i in range(steps):
             params, opt_state, loss = step_fn(params, opt_state, x, y)
-            print(f"[{sharding_mode}] Step {i}, Loss: {loss:.4f}")
+            # Convert loss to float for proper formatting
+            loss_float = float(loss)
+            print(f"[{sharding_mode}] Step {i}, Loss: {loss_float:.4f}")
 
 if __name__ == "__main__":
     test_gemm_training("dp")    # Run with data parallel
