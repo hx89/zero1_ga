@@ -23,25 +23,38 @@ def init_training_state(apply_fn, params, tx):
   return state
 
 # Add MaxText-style initialization function
-def init_initial_state(model_fn, optimizer, rng):
+def init_initial_state(model, optimizer, rng):
     """Initialize training state similar to MaxText style"""
-    # Initialize parameters
-    params = model_fn(rng)
-    return init_training_state(model_fn, params, optimizer)
+    # Initialize parameters using the Flax model
+    params = model.init(rng, jnp.zeros((1, model.in_dim), dtype=model.dtype))
+    return init_training_state(model.apply, params, optimizer)
 
 def get_input_data_sharding(config, mesh):
   """Get the input data sharding for the model"""
   return nn.logical_to_mesh_sharding(P(*config.input_data_sharding_logical_axes), mesh, config.logical_axis_rules)
 
-# Dummy GEMM model: y = x @ W
-def forward(params, x):
-    # h = x @ params['W1'].astype(jnp.bfloat16)
-    # h = jax.nn.relu(h).astype(jnp.bfloat16)
-    # return h @ params['W2'].astype(jnp.bfloat16)
-    return x @ params['W1'].astype(jnp.bfloat16)
+# Flax Linen module for the model
+class SimpleLinearModel(nn.Module):
+    """Simple linear model: y = x @ W"""
+    in_dim: int
+    out_dim: int
+    dtype: jnp.dtype = jnp.float32
+    
+    @nn.compact
+    def __call__(self, x):
+        # Apply linear transformation
+        x = x.astype(self.dtype)
+        x = nn.Dense(
+            features=self.out_dim,
+            dtype=self.dtype,
+            kernel_init=nn.initializers.normal(stddev=0.02),
+            name='W1'
+        )(x)
+        return x
 
-def loss_fn(params, x):
-    y_pred = forward(params, x)
+def loss_fn(model, params, x):
+    """Loss function using the Flax model"""
+    y_pred = model.apply(params, x)
     return jnp.mean((y_pred - x) ** 2)
 
 # def create_train_step(optimizer, grad_accum_steps=1):
@@ -71,7 +84,7 @@ def loss_fn(params, x):
 #     return train_step
 
 # Scan loop version
-def create_train_step(optimizer, grad_accum_steps=1, params_shardings=None):
+def create_train_step(optimizer, model, grad_accum_steps=1, params_shardings=None):
     def train_step(state, x):
         params = state.params
         params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
@@ -88,7 +101,7 @@ def create_train_step(optimizer, grad_accum_steps=1, params_shardings=None):
             grads_accum, loss_accum = carry
             x_mb = microbatch_data
             
-            loss, grads = jax.value_and_grad(loss_fn)(params, x_mb)
+            loss, grads = jax.value_and_grad(loss_fn, argnums=1)(model, params, x_mb)
             
             if grads_accum is None:
                 new_grads_accum = grads
@@ -125,11 +138,8 @@ def test_gemm_training(sharding_mode="dp"):
     steps = 5
     ga = 2
 
-    # Create a simple model function for initialization
-    def model_fn(rng):
-        return {
-            'W1': random.normal(rng, (in_dim, out_dim), dtype=jnp.float32),
-        }
+    # Create the Flax model
+    model = SimpleLinearModel(in_dim=in_dim, out_dim=out_dim, dtype=jnp.float32)
     # Create config-like object for logical axis rules
     class Config:
         def __init__(self):
@@ -185,7 +195,7 @@ def test_gemm_training(sharding_mode="dp"):
     if nn is not None and nn_partitioning is not None:
         print('Using MaxText sharding')
         # Use MaxText's nn module if available
-        init_state_partial = functools.partial(init_initial_state, model_fn, optimizer, key)
+        init_state_partial = functools.partial(init_initial_state, model, optimizer, key)
         with nn_partitioning.axis_rules(config.logical_axis_rules):
             abstract_state = jax.eval_shape(init_state_partial)
         state_logical_annotations = nn.get_partition_spec(abstract_state)
@@ -203,7 +213,7 @@ def test_gemm_training(sharding_mode="dp"):
     out_shardings = (state_mesh_shardings, None)  # State, metrics
     
     # Create the train step function
-    train_step_fn = create_train_step(optimizer, grad_accum_steps=ga, params_shardings=state_mesh_shardings.params)
+    train_step_fn = create_train_step(optimizer, model, grad_accum_steps=ga, params_shardings=state_mesh_shardings.params)
     
     # JIT the train step function
     p_train_step = jax.jit(
@@ -214,7 +224,17 @@ def test_gemm_training(sharding_mode="dp"):
     )
 
     # Initialize parameters and optimizer state
-    state = init_initial_state(model_fn, optimizer, key)
+    # state = init_initial_state(model, optimizer, key)
+    init_state_partial = functools.partial(init_initial_state, model, optimizer)
+    init_state_partial.__name__ = "initialize_state"
+    # params_shardings, _state_mesh_shardings = maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
+
+    # pylint: disable=not-callable
+    state = jax.jit(
+        init_state_partial,
+        in_shardings=None,
+        out_shardings=state_mesh_shardings,
+    )(key)
 
     for i in range(steps):
         example_batch = jax.lax.with_sharding_constraint(x, data_sharding)
