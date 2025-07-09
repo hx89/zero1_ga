@@ -10,6 +10,7 @@ from typing import NamedTuple
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
+# from MaxText.layers import linears
 
 # Add a simple state structure similar to MaxText
 class TrainingState(NamedTuple):
@@ -38,19 +39,46 @@ class SimpleLinearModel(nn.Module):
     """Simple linear model: y = x @ W"""
     in_dim: int
     out_dim: int
-    dtype: jnp.dtype = jnp.float32
-    
+    dtype: jnp.dtype = jnp.bfloat16
+    weights_dtype: jnp.dtype = jnp.float32
+
     @nn.compact
     def __call__(self, x):
         # Apply linear transformation
         x = x.astype(self.dtype)
         x = nn.Dense(
             features=self.out_dim,
+            use_bias=False,
+            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("batch", None)),
             dtype=self.dtype,
-            kernel_init=nn.initializers.normal(stddev=0.02),
+            param_dtype=self.weights_dtype,
             name='W1'
         )(x)
         return x
+
+
+# # MaxText-style module for the model
+# class SimpleMaxtextLinearModel(nn.Module):
+#     """Simple linear model: y = x @ W"""
+#     in_dim: int
+#     out_dim: int
+#     dtype: jnp.dtype = jnp.bfloat16
+#     weights_dtype: jnp.dtype = jnp.float32
+
+#     @nn.compact
+#     def __call__(self, x):
+#         # Apply linear transformation
+#         x = x.astype(self.dtype)
+#         x = linears.dense_general(
+#             in_features=self.in_dim,
+#             features=self.out_dim,
+#             use_bias=False,
+#             kernel_axes=("batch", None),
+#             dtype=self.dtype,
+#             weight_dtype=self.weights_dtype,
+#             name='W1'
+#         )(x)
+#         return x
 
 def loss_fn(model, params, x):
     """Loss function using the Flax model"""
@@ -87,7 +115,7 @@ def loss_fn(model, params, x):
 def create_train_step(optimizer, model, grad_accum_steps=1, params_shardings=None):
     def train_step(state, x):
         params = state.params
-        params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
+        # params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
         opt_state = state.opt_state
         # Split x and y into microbatches
         microbatch_size = x.shape[0] // grad_accum_steps
@@ -139,7 +167,8 @@ def test_gemm_training(sharding_mode="dp"):
     ga = 2
 
     # Create the Flax model
-    model = SimpleLinearModel(in_dim=in_dim, out_dim=out_dim, dtype=jnp.float32)
+    model = SimpleLinearModel(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
+    # model = SimpleMaxtextLinearModel(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
     # Create config-like object for logical axis rules
     class Config:
         def __init__(self):
@@ -150,7 +179,7 @@ def test_gemm_training(sharding_mode="dp"):
                 ('heads', None),
                 ('kv', None),
             ]
-            self.input_data_sharding_logical_axes = ('batch', 'hidden')
+            self.input_data_sharding_logical_axes = ('batch', 'embed')
     config = Config()
 
     # Data
