@@ -117,21 +117,6 @@ class SimpleLinearModel(nn.Module):
         )(x)
         return x
 
-# # Alternative approach: Create a separate model with remat
-# class SimpleLinearModelWithRemat(nn.Module):
-#     """Simple linear model with remat for gradient checkpointing"""
-#     in_dim: int
-#     out_dim: int
-#     dtype: jnp.dtype = jnp.bfloat16
-#     weights_dtype: jnp.dtype = jnp.float32
-    
-#     @nn.compact
-#     def __call__(self, x):
-#         # Apply remat to the entire forward pass
-#         layer = SimpleLinearModel(in_dim=self.in_dim, out_dim=self.out_dim, dtype=self.dtype, weights_dtype=self.weights_dtype)
-#         remat_layer = nn.remat(layer)
-#         return remat_layer(x)
-
 def loss_fn(model, params, x):
     """Loss function using the Flax model"""
     y_pred = model.apply(params, x)
@@ -226,7 +211,6 @@ def test_gemm_training(sharding_mode="dp"):
 
     # Create the Flax model
     model = SimpleLinearModel(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
-    # model = SimpleMaxtextLinearModel(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
     # Create config-like object for logical axis rules
     class Config:
         def __init__(self):
@@ -244,19 +228,10 @@ def test_gemm_training(sharding_mode="dp"):
     key = random.PRNGKey(0)
     target_params = 0.5
     x = random.normal(key, (batch_size, in_dim), dtype=jnp.bfloat16)
-    # y = x * target_params
     print("x shape: ", x.shape)
-
-    # Params
-    # params = {
-    #     # 'W1': random.normal(key, (in_dim, hidden_dim), dtype=jnp.float32),  
-    #     # 'W2': random.normal(key, (hidden_dim, out_dim), dtype=jnp.float32)
-    #     'W1': random.normal(key, (in_dim, out_dim), dtype=jnp.float32),  
-    # }
 
     # Optimizer
     optimizer = optax.adamw(learning_rate, b1=0.9, b2=0.95, eps=1e-8, eps_root=1e-16, weight_decay=0.1, mu_dtype=jnp.float32)
-    # opt_state = optimizer.init(params)
 
     # Mesh and sharding
     devices = jax.devices()
@@ -324,10 +299,8 @@ def test_gemm_training(sharding_mode="dp"):
     )
 
     # Initialize parameters and optimizer state
-    # state = init_initial_state(model, optimizer, key)
     init_state_partial = functools.partial(init_initial_state, model, optimizer)
     init_state_partial.__name__ = "initialize_state"
-    # params_shardings, _state_mesh_shardings = maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
     # pylint: disable=not-callable
     state = jax.jit(
