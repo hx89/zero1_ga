@@ -187,12 +187,12 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
                 new_grads_accum = grads
             else:
                 new_grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads_accum, grads)
-            
+
             new_loss_accum = loss_accum + loss
             return (params, new_grads_accum, new_loss_accum), None
         
         # Initialize carry
-        print('params_shardings: ', params_shardings)
+        # Unshard params to trigger AG
         params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
         # params = jax.device_put(params, jax.sharding.NamedSharding(mesh, P(None, None)))
         init_grads = jax.tree_util.tree_map(jnp.zeros_like, params)
@@ -202,6 +202,9 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         microbatch_data = x_microbatches
         (_, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, init_carry, microbatch_data)
         
+        # Unshard grads_accum 
+        grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings)
+
         # Average gradients and loss
         grads_accum = jax.tree_util.tree_map(lambda a: a / grad_accum_steps, grads_accum)
         loss_accum = loss_accum / grad_accum_steps
@@ -294,6 +297,7 @@ def test_gemm_training(sharding_mode="dp"):
                 state_mesh_shardings_w_data.opt_state
             )
         )
+        # Shard params to be the same as the opt_state, keep the orginal params shardings in params_shardings
         params_shardings, state_mesh_shardings_w_data = maybe_update_params_sharding_with_opt(state_mesh_shardings_w_data)
     else:
         print('Using fallback manual sharding')
