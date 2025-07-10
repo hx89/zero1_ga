@@ -7,6 +7,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 import numpy as np
 import functools
 from typing import NamedTuple
+import flax
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
@@ -34,6 +35,65 @@ def get_input_data_sharding(config, mesh):
   """Get the input data sharding for the model"""
   return nn.logical_to_mesh_sharding(P(*config.input_data_sharding_logical_axes), mesh, config.logical_axis_rules)
 
+
+def unbox_logicallypartioned(boxed_pytree):
+  """Unboxes the flax.LogicallyPartitioned pieces
+
+  Args:
+    boxed_pytree: a pytree that includes LogicallyPartitioned
+      leaves.
+  Returns:
+    a pytree where all all LogicallyPartitioned leaves have been unboxed.
+  """
+  return jax.tree_util.tree_map(
+      lambda x: x.unbox() if isinstance(x, flax.linen.spmd.LogicallyPartitioned) else x,
+      boxed_pytree,
+      is_leaf=lambda k: isinstance(k, flax.linen.spmd.LogicallyPartitioned),
+  )
+
+
+def add_data_to_sharding(mesh, path, aval, sharding):
+  if not isinstance(sharding, jax.sharding.NamedSharding):
+    raise AssertionError(f"Expected NamedSharding, found {sharding} of {type(sharding)=} at {jax.tree_util.keystr(path)}")
+  try:
+    sharded_shape = sharding.shard_shape(aval.shape)
+  except Exception as e:
+    raise AssertionError(f"Could not shard value {jax.tree_util.keystr(path)} of shape={aval.shape} with {sharding=}") from e
+  pspec = sharding.spec
+
+  if 'data' in jax.tree.leaves(pspec):
+    return sharding
+
+  for idx, (size, partition) in enumerate(zip(sharded_shape, pspec)):
+    if partition is None:
+      partition = ()
+
+    if isinstance(partition, str):
+      partition = (partition,)
+
+    if size % mesh.shape['dp'] == 0 and (partition is None or 'tensor' not in partition):
+      added_component = ('dp',) + partition
+      new_pspec = jax.sharding.PartitionSpec(*(pspec[:idx] + (added_component,) + pspec[idx+1:]))
+      new_sharding = jax.sharding.NamedSharding(sharding.mesh, new_pspec)
+      # return sharding.with_spec(new_pspec)
+      return new_sharding
+  return sharding
+
+def maybe_update_params_sharding_with_opt(state_mesh_shardings):
+  prev_params_shardings = state_mesh_shardings.params
+  if isinstance(state_mesh_shardings.opt_state, optax.ScaleByAdamState):
+    sharded_fp32_params = state_mesh_shardings.opt_state.mu
+  elif isinstance(state_mesh_shardings.opt_state, tuple) and isinstance(state_mesh_shardings.opt_state[0], optax.ScaleByAdamState):
+    sharded_fp32_params = state_mesh_shardings.opt_state[0].mu
+  else:
+    raise NotImplementedError(f"Could not find optimizer state shardings from optimizer of type {type(state_mesh_shardings.opt_state)}")
+  if "params" not in sharded_fp32_params.keys():
+    # When quantization=fp8 is enabled the sharded_fp32_params
+    # are not wrapped in `params`. Here we wrap them back.
+    sharded_fp32_params = {"params": sharded_fp32_params}
+  state_mesh_shardings = state_mesh_shardings.replace(params=dict(prev_params_shardings, **sharded_fp32_params))
+  return prev_params_shardings, state_mesh_shardings
+
 # Flax Linen module for the model
 class SimpleLinearModel(nn.Module):
     """Simple linear model: y = x @ W"""
@@ -49,40 +109,33 @@ class SimpleLinearModel(nn.Module):
         x = nn.Dense(
             features=self.out_dim,
             use_bias=False,
-            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("batch", None)),
+            # kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("batch", None)),
+            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), (None, None)),
             dtype=self.dtype,
             param_dtype=self.weights_dtype,
             name='W1'
         )(x)
         return x
 
-
-# # MaxText-style module for the model
-# class SimpleMaxtextLinearModel(nn.Module):
-#     """Simple linear model: y = x @ W"""
+# # Alternative approach: Create a separate model with remat
+# class SimpleLinearModelWithRemat(nn.Module):
+#     """Simple linear model with remat for gradient checkpointing"""
 #     in_dim: int
 #     out_dim: int
 #     dtype: jnp.dtype = jnp.bfloat16
 #     weights_dtype: jnp.dtype = jnp.float32
-
+    
 #     @nn.compact
 #     def __call__(self, x):
-#         # Apply linear transformation
-#         x = x.astype(self.dtype)
-#         x = linears.dense_general(
-#             in_features=self.in_dim,
-#             features=self.out_dim,
-#             use_bias=False,
-#             kernel_axes=("batch", None),
-#             dtype=self.dtype,
-#             weight_dtype=self.weights_dtype,
-#             name='W1'
-#         )(x)
-#         return x
+#         # Apply remat to the entire forward pass
+#         layer = SimpleLinearModel(in_dim=self.in_dim, out_dim=self.out_dim, dtype=self.dtype, weights_dtype=self.weights_dtype)
+#         remat_layer = nn.remat(layer)
+#         return remat_layer(x)
 
 def loss_fn(model, params, x):
     """Loss function using the Flax model"""
     y_pred = model.apply(params, x)
+    # y_pred = nn.remat(model.apply)(params, x)
     return jnp.mean((y_pred - x) ** 2)
 
 # def create_train_step(optimizer, grad_accum_steps=1):
@@ -112,10 +165,9 @@ def loss_fn(model, params, x):
 #     return train_step
 
 # Scan loop version
-def create_train_step(optimizer, model, grad_accum_steps=1, params_shardings=None):
+def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardings=None):
     def train_step(state, x):
         params = state.params
-        # params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
         opt_state = state.opt_state
         # Split x and y into microbatches
         microbatch_size = x.shape[0] // grad_accum_steps
@@ -126,7 +178,7 @@ def create_train_step(optimizer, model, grad_accum_steps=1, params_shardings=Non
         x_microbatches = x.reshape(grad_accum_steps, microbatch_size, -1)
         
         def grad_accum_body(carry, microbatch_data):
-            grads_accum, loss_accum = carry
+            params, grads_accum, loss_accum = carry
             x_mb = microbatch_data
             
             loss, grads = jax.value_and_grad(loss_fn, argnums=1)(model, params, x_mb)
@@ -137,15 +189,18 @@ def create_train_step(optimizer, model, grad_accum_steps=1, params_shardings=Non
                 new_grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads_accum, grads)
             
             new_loss_accum = loss_accum + loss
-            return (new_grads_accum, new_loss_accum), None
+            return (params, new_grads_accum, new_loss_accum), None
         
         # Initialize carry
+        print('params_shardings: ', params_shardings)
+        params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
+        # params = jax.device_put(params, jax.sharding.NamedSharding(mesh, P(None, None)))
         init_grads = jax.tree_util.tree_map(jnp.zeros_like, params)
-        init_carry = (init_grads, 0.0)
+        init_carry = (params, init_grads, 0.0)
         
         # Use scan to accumulate gradients
         microbatch_data = x_microbatches
-        (grads_accum, loss_accum), _ = lax.scan(grad_accum_body, init_carry, microbatch_data)
+        (_, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, init_carry, microbatch_data)
         
         # Average gradients and loss
         grads_accum = jax.tree_util.tree_map(lambda a: a / grad_accum_steps, grads_accum)
@@ -229,6 +284,17 @@ def test_gemm_training(sharding_mode="dp"):
             abstract_state = jax.eval_shape(init_state_partial)
         state_logical_annotations = nn.get_partition_spec(abstract_state)
         state_mesh_shardings = nn.logical_to_mesh_sharding(state_logical_annotations, mesh, config.logical_axis_rules)
+
+        # Create new state_mesh_shardings with data sharding added to opt_state
+        state_mesh_shardings_w_data = jax.tree_util.tree_map(lambda x: x, state_mesh_shardings)
+        state_mesh_shardings_w_data = state_mesh_shardings_w_data.replace(
+            opt_state=jax.tree.map_with_path(
+                functools.partial(add_data_to_sharding, mesh), 
+                unbox_logicallypartioned(abstract_state).opt_state, 
+                state_mesh_shardings_w_data.opt_state
+            )
+        )
+        params_shardings, state_mesh_shardings_w_data = maybe_update_params_sharding_with_opt(state_mesh_shardings_w_data)
     else:
         print('Using fallback manual sharding')
         # Fallback: create shardings manually
@@ -238,11 +304,12 @@ def test_gemm_training(sharding_mode="dp"):
             # 'step': jax.sharding.NamedSharding(mesh, P(None))
         }
     data_sharding = get_input_data_sharding(config, mesh)
-    in_shardings = (state_mesh_shardings, data_sharding)  # State, batch
-    out_shardings = (state_mesh_shardings, None)  # State, metrics
-    
+    in_shardings = (state_mesh_shardings_w_data, data_sharding)  # State, batch
+    out_shardings = (state_mesh_shardings_w_data, None)  # State, metrics
+    print('data_sharding: ', data_sharding)
+
     # Create the train step function
-    train_step_fn = create_train_step(optimizer, model, grad_accum_steps=ga, params_shardings=state_mesh_shardings.params)
+    train_step_fn = create_train_step(optimizer, model, mesh, grad_accum_steps=ga, params_shardings=params_shardings)
     
     # JIT the train step function
     p_train_step = jax.jit(
@@ -264,6 +331,7 @@ def test_gemm_training(sharding_mode="dp"):
         in_shardings=None,
         out_shardings=state_mesh_shardings,
     )(key)
+    state = unbox_logicallypartioned(state)
 
     for i in range(steps):
         example_batch = jax.lax.with_sharding_constraint(x, data_sharding)
