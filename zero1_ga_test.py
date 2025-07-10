@@ -13,11 +13,7 @@ from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
 # from MaxText.layers import linears
 
-# Add a simple state structure similar to MaxText
-class TrainingState(NamedTuple):
-    params: dict
-    opt_state: optax.OptState
-    step: int
+jax.config.update('jax_log_checkpoint_residuals', True)
 
 def init_training_state(apply_fn, params, tx):
   """Init train state with null opt state for decode."""
@@ -107,6 +103,30 @@ class SimpleLinearModel(nn.Module):
         # Apply linear transformation
         x = x.astype(self.dtype)
         x = nn.Dense(
+            features=self.out_dim,
+            use_bias=False,
+            # kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("batch", None)),
+            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), (None, None)),
+            dtype=self.dtype,
+            param_dtype=self.weights_dtype,
+            name='W1'
+        )(x)
+        return x
+
+# Flax Linen module for the model with remat
+class SimpleLinearModelRemat(nn.Module):
+    """Simple linear model: y = x @ W"""
+    in_dim: int
+    out_dim: int
+    dtype: jnp.dtype = jnp.bfloat16
+    weights_dtype: jnp.dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, x):
+        RematDense = nn.remat(nn.Dense)
+        # Apply linear transformation
+        x = x.astype(self.dtype)
+        x = RematDense(
             features=self.out_dim,
             use_bias=False,
             # kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("batch", None)),
@@ -211,6 +231,7 @@ def test_gemm_training(sharding_mode="dp"):
 
     # Create the Flax model
     model = SimpleLinearModel(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
+    # model = SimpleLinearModelRemat(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
     # Create config-like object for logical axis rules
     class Config:
         def __init__(self):
