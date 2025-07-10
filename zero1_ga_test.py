@@ -329,7 +329,7 @@ def test_gemm_training(sharding_mode="dp"):
     state = jax.jit(
         init_state_partial,
         in_shardings=None,
-        out_shardings=state_mesh_shardings,
+        out_shardings=state_mesh_shardings_w_data,
     )(key)
     state = unbox_logicallypartioned(state)
 
@@ -337,7 +337,7 @@ def test_gemm_training(sharding_mode="dp"):
         example_batch = jax.lax.with_sharding_constraint(x, data_sharding)
         with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
           # Apply sharding constraint to state to match expected sharding
-          state = jax.lax.with_sharding_constraint(state, state_mesh_shardings)
+          state = jax.lax.with_sharding_constraint(state, state_mesh_shardings_w_data)
           state, loss = p_train_step(state, example_batch)
           loss_float = float(loss)
           print(f"[{sharding_mode}] Step {i}, Loss: {loss_float:.4f}")
