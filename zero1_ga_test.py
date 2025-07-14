@@ -170,7 +170,7 @@ def loss_fn(model, params, x):
 #     return train_step
 
 # Scan loop version
-def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardings=None):
+def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardings=None, params_shardings_sharded=None):
     def train_step(state, x):
         params = state.params
         opt_state = state.opt_state
@@ -185,16 +185,21 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         def grad_accum_body(carry, microbatch_data):
             params_bf16, grads_accum, loss_accum = carry
             x_mb = microbatch_data
-            
+            grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings) 
+
             # Use params_bf16 for forward pass
             loss, grads = jax.value_and_grad(loss_fn, argnums=1)(model, params_bf16, x_mb)
-            
+            grads = jax.tree.map(jax.lax.with_sharding_constraint, grads, params_shardings) 
             if grads_accum is None:
-                new_grads_accum = grads
+                # new_grads_accum = grads
+                grads_accum = grads
             else:
-                new_grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads_accum, grads)
+                # new_grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads_accum, grads)
+                grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads_accum, grads)
+            # new_grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, new_grads_accum, params_shardings) 
+            grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings) 
             new_loss_accum = loss_accum + loss
-            return (params_bf16, new_grads_accum, new_loss_accum), None
+            return (params_bf16, grads_accum, new_loss_accum), None
         
         # Initialize carry
         # Unshard params to trigger AG
@@ -208,6 +213,7 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         params_bf16 = jax.tree_util.tree_map(convert_to_bf16, params)
         params_bf16 = jax.tree.map(jax.lax.with_sharding_constraint, params_bf16, params_shardings)
         init_grads = jax.tree_util.tree_map(jnp.zeros_like, params_bf16)
+        init_grads = jax.tree.map(jax.lax.with_sharding_constraint, init_grads, params_shardings)
         init_carry = (params_bf16, init_grads, 0.0)
         
         # Use scan to accumulate gradients
@@ -216,10 +222,14 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         
         # Unshard grads_accum 
         grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings)
+        # print('params_shardings_sharded: ', params_shardings_sharded)
+        # grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings_sharded)
 
         # Average gradients and loss
         grads_accum = jax.tree_util.tree_map(lambda a: a / grad_accum_steps, grads_accum)
         loss_accum = loss_accum / grad_accum_steps
+
+        grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings_sharded)
 
         # updates, opt_state = optimizer.update(grads_accum, opt_state, params)
         # new_params = optax.apply_updates(params, updates)
@@ -316,7 +326,7 @@ def test_gemm_training(sharding_mode="dp"):
     print('data_sharding: ', data_sharding)
 
     # Create the train step function
-    train_step_fn = create_train_step(optimizer, model, mesh, grad_accum_steps=ga, params_shardings=params_shardings)
+    train_step_fn = create_train_step(optimizer, model, mesh, grad_accum_steps=ga, params_shardings=params_shardings, params_shardings_sharded=state_mesh_shardings_w_data.params)
     
     # JIT the train step function
     p_train_step = jax.jit(
