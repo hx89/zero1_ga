@@ -183,25 +183,32 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         x_microbatches = x.reshape(grad_accum_steps, microbatch_size, -1)
         
         def grad_accum_body(carry, microbatch_data):
-            params, grads_accum, loss_accum = carry
+            params_bf16, grads_accum, loss_accum = carry
             x_mb = microbatch_data
             
-            loss, grads = jax.value_and_grad(loss_fn, argnums=1)(model, params, x_mb)
+            # Use params_bf16 for forward pass
+            loss, grads = jax.value_and_grad(loss_fn, argnums=1)(model, params_bf16, x_mb)
             
             if grads_accum is None:
                 new_grads_accum = grads
             else:
                 new_grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads_accum, grads)
-
             new_loss_accum = loss_accum + loss
-            return (params, new_grads_accum, new_loss_accum), None
+            return (params_bf16, new_grads_accum, new_loss_accum), None
         
         # Initialize carry
         # Unshard params to trigger AG
-        params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
+        # params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
         # params = jax.device_put(params, jax.sharding.NamedSharding(mesh, P(None, None)))
-        init_grads = jax.tree_util.tree_map(jnp.zeros_like, params)
-        init_carry = (params, init_grads, 0.0)
+        # Convert params to bf16
+        def convert_to_bf16(param):
+            if param.dtype == jnp.float32:
+                return param.astype(jnp.bfloat16)
+            return param
+        params_bf16 = jax.tree_util.tree_map(convert_to_bf16, params)
+        params_bf16 = jax.tree.map(jax.lax.with_sharding_constraint, params_bf16, params_shardings)
+        init_grads = jax.tree_util.tree_map(jnp.zeros_like, params_bf16)
+        init_carry = (params_bf16, init_grads, 0.0)
         
         # Use scan to accumulate gradients
         microbatch_data = x_microbatches
@@ -230,8 +237,8 @@ def test_gemm_training(sharding_mode="dp"):
     ga = 2
 
     # Create the Flax model
-    model = SimpleLinearModel(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
-    # model = SimpleLinearModelRemat(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
+    # model = SimpleLinearModel(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
+    model = SimpleLinearModelRemat(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
     # Create config-like object for logical axis rules
     class Config:
         def __init__(self):
