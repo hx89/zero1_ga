@@ -90,6 +90,15 @@ def maybe_update_params_sharding_with_opt(state_mesh_shardings):
   state_mesh_shardings = state_mesh_shardings.replace(params=dict(prev_params_shardings, **sharded_fp32_params))
   return prev_params_shardings, state_mesh_shardings
 
+def named_sharding_to_partition_spec(sharding):
+  """Convert NamedSharding to PartitionSpec for shard_map"""
+  if isinstance(sharding, jax.sharding.NamedSharding):
+    return sharding.spec
+  elif isinstance(sharding, dict):
+    return jax.tree_util.tree_map(named_sharding_to_partition_spec, sharding)
+  else:
+    return sharding
+
 # Flax Linen module for the model
 class SimpleLinearModel(nn.Module):
     """Simple linear model: y = x @ W"""
@@ -170,7 +179,7 @@ def loss_fn(model, params, x):
 #     return train_step
 
 # Scan loop version
-def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardings=None, params_shardings_sharded=None):
+def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardings=None, params_shardings_sharded=None, state_mesh_shardings_w_data=None):
     def train_step(state, x):
         params = state.params
         opt_state = state.opt_state
@@ -180,8 +189,10 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         print('grad_accum_steps: ', grad_accum_steps)
         
         # Create microbatch data
-        x_microbatches = x.reshape(grad_accum_steps, microbatch_size, -1)
-        
+        # x_microbatches = x.reshape(grad_accum_steps, microbatch_size, -1)
+        x_microbatches = x.reshape(grad_accum_steps, microbatch_size, -1, order='F')
+        x_microbatches = lax.with_sharding_constraint(x_microbatches, P(None, 'dp', None))
+
         def grad_accum_body(carry, microbatch_data):
             params_bf16, grads_accum, loss_accum = carry
             x_mb = microbatch_data
@@ -222,19 +233,56 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         
         # Unshard grads_accum 
         grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings)
-        # print('params_shardings_sharded: ', params_shardings_sharded)
         # grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings_sharded)
 
         # Average gradients and loss
         grads_accum = jax.tree_util.tree_map(lambda a: a / grad_accum_steps, grads_accum)
         loss_accum = loss_accum / grad_accum_steps
 
-        grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings_sharded)
+        # grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings_sharded)
+
+        # def process_gradients(grads_accum):
+        #     averaged = jax.tree_util.tree_map(lambda a: a / grad_accum_steps, grads_accum)
+        #     return averaged
+        # # Convert NamedSharding to PartitionSpec for shard_map
+        # in_pspecs = named_sharding_to_partition_spec(params_shardings)
+        # out_pspecs = named_sharding_to_partition_spec(params_shardings_sharded)
+        # print('params_shardings: ', params_shardings)
+        # print('params_shardings_sharded: ', params_shardings_sharded)
+        # print('in_pspecs: ', in_pspecs)
+        # print('out_pspecs: ', out_pspecs)
+        # print('grads_accum structure: ', jax.tree_util.tree_structure(grads_accum))
+        # print('in_pspecs structure: ', jax.tree_util.tree_structure(in_pspecs))
+        # from jax.tree_util import tree_map
+        # print("grads_accum types:")
+        # print(tree_map(lambda x: type(x), grads_accum))
+        # print("in_specs types:")
+        # print(tree_map(lambda x: type(x), in_pspecs))
+        # grads_accum = jax.shard_map(process_gradients, mesh=mesh, in_specs=in_pspecs, out_specs=out_pspecs)(grads_accum)
 
         # updates, opt_state = optimizer.update(grads_accum, opt_state, params)
         # new_params = optax.apply_updates(params, updates)
         # return new_params, opt_state, loss_accum
+
         new_state = state.apply_gradients(grads=grads_accum)
+
+        # # Wrap state.apply_gradients in shard_map
+        # def apply_gradients_sharded(state, grads):
+        #     return state.apply_gradients(grads=grads)
+        
+        # # Convert NamedSharding to PartitionSpec for shard_map
+        # state_pspecs = named_sharding_to_partition_spec(state_mesh_shardings_w_data)
+        # grads_pspecs = named_sharding_to_partition_spec(params_shardings_sharded)
+        # print('state_pspecs: ', state_pspecs)
+        # print('grads_pspecs: ', grads_pspecs)
+
+        # new_state = jax.shard_map(
+        #     apply_gradients_sharded,
+        #     mesh=mesh,
+        #     in_specs=(state_pspecs, grads_pspecs),  # state, grads_accum
+        #     out_specs=state_pspecs,  # new_state
+        # )(state, grads_accum)
+
         return new_state, loss_accum
     return train_step
 
@@ -300,6 +348,7 @@ def test_gemm_training(sharding_mode="dp"):
             abstract_state = jax.eval_shape(init_state_partial)
         state_logical_annotations = nn.get_partition_spec(abstract_state)
         state_mesh_shardings = nn.logical_to_mesh_sharding(state_logical_annotations, mesh, config.logical_axis_rules)
+        print('state_logical_annotations: ', state_logical_annotations)
 
         # Create new state_mesh_shardings with data sharding added to opt_state
         state_mesh_shardings_w_data = jax.tree_util.tree_map(lambda x: x, state_mesh_shardings)
@@ -326,7 +375,7 @@ def test_gemm_training(sharding_mode="dp"):
     print('data_sharding: ', data_sharding)
 
     # Create the train step function
-    train_step_fn = create_train_step(optimizer, model, mesh, grad_accum_steps=ga, params_shardings=params_shardings, params_shardings_sharded=state_mesh_shardings_w_data.params)
+    train_step_fn = create_train_step(optimizer, model, mesh, grad_accum_steps=ga, params_shardings=params_shardings, params_shardings_sharded=state_mesh_shardings_w_data.params, state_mesh_shardings_w_data=state_mesh_shardings_w_data)
     
     # JIT the train step function
     p_train_step = jax.jit(
