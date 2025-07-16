@@ -144,6 +144,15 @@ class SimpleLinearModelRemat(nn.Module):
             param_dtype=self.weights_dtype,
             name='W1'
         )(x)
+        x = RematDense(
+            features=self.out_dim,
+            use_bias=False,
+            # kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("batch", None)),
+            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), (None, None)),
+            dtype=self.dtype,
+            param_dtype=self.weights_dtype,
+            name='W2'
+        )(x)
         return x
 
 def loss_fn(model, params, x):
@@ -196,19 +205,15 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         def grad_accum_body(carry, microbatch_data):
             params_bf16, grads_accum, loss_accum = carry
             x_mb = microbatch_data
-            grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings) 
-
-            # Use params_bf16 for forward pass
+            
+            # Use params_bf16 for forward pass (no all-gather inside loop)
             loss, grads = jax.value_and_grad(loss_fn, argnums=1)(model, params_bf16, x_mb)
-            grads = jax.tree.map(jax.lax.with_sharding_constraint, grads, params_shardings) 
+            
             if grads_accum is None:
-                # new_grads_accum = grads
                 grads_accum = grads
             else:
-                # new_grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads_accum, grads)
                 grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads_accum, grads)
-            # new_grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, new_grads_accum, params_shardings) 
-            grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings) 
+            
             new_loss_accum = loss_accum + loss
             return (params_bf16, grads_accum, new_loss_accum), None
         
@@ -229,7 +234,25 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         
         # Use scan to accumulate gradients
         microbatch_data = x_microbatches
-        (_, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, init_carry, microbatch_data)
+        # (_, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, init_carry, microbatch_data)
+
+        # Peel first iteration to overlap all-gather with compute
+        if grad_accum_steps > 1:
+            # Process first microbatch (no all-gather inside)
+            first_mb = microbatch_data[0]
+            first_carry = (params_bf16, init_grads, 0.0)
+            (_, first_grads, first_loss), _ = grad_accum_body(first_carry, first_mb)
+            
+            # Start all-gather for first microbatch (this can overlap with scan)
+            first_grads = jax.tree.map(jax.lax.with_sharding_constraint, first_grads, params_shardings)
+            
+            # Process remaining microbatches with scan (no all-gather inside loop)
+            remaining_mb = microbatch_data[1:]
+            remaining_carry = (params_bf16, first_grads, first_loss)
+            (_, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, remaining_carry, remaining_mb)
+        else:
+            # Single microbatch case
+            (_, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, init_carry, microbatch_data)
         
         # Unshard grads_accum 
         grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings)
@@ -292,7 +315,7 @@ def test_gemm_training(sharding_mode="dp"):
     batch_size, in_dim, out_dim, hidden_dim = 128, 4096, 4096, 4096*8
     learning_rate = 0.1
     steps = 5
-    ga = 2
+    ga = 4
 
     # Create the Flax model
     # model = SimpleLinearModel(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
