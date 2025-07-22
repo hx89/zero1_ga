@@ -240,8 +240,7 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         if grad_accum_steps > 1:
             # Process first microbatch (no all-gather inside)
             first_mb = microbatch_data[0]
-            first_carry = (params_bf16, init_grads, 0.0)
-            (_, first_grads, first_loss), _ = grad_accum_body(first_carry, first_mb)
+            (_, first_grads, first_loss), _ = grad_accum_body(init_carry, first_mb)
             
             # Start all-gather for first microbatch (this can overlap with scan)
             first_grads = jax.tree.map(jax.lax.with_sharding_constraint, first_grads, params_shardings)
