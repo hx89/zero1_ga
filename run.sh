@@ -15,6 +15,9 @@ export NCCL_NVLS_ENABLE=1
 #export NCCL_ALGO=NVLS
 export NCCL_CTA_POLICY=1
 
+export TF_CPP_MIN_LOG_LEVEL=0
+export TF_CPP_MAX_LOG_LEVEL=10
+
 COMBINE_THRESHOLD=4000
 
 export XLA_FLAGS="--xla_gpu_enable_nccl_user_buffers=true --xla_dump_hlo_as_text --xla_dump_to=${XLA_DUMP_DIR} --xla_dump_hlo_pass_re=.* --xla_gpu_enable_triton_gemm=false --xla_gpu_enable_command_buffer= --xla_gpu_graph_level=0 --xla_gpu_all_reduce_combine_threshold_bytes=$COMBINE_THRESHOLD --xla_gpu_all_gather_combine_threshold_bytes=$COMBINE_THRESHOLD --xla_gpu_reduce_scatter_combine_threshold_bytes=$COMBINE_THRESHOLD --xla_gpu_enable_latency_hiding_scheduler=true"

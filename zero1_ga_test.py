@@ -14,6 +14,7 @@ from flax.training import train_state
 # from MaxText.layers import linears
 
 jax.config.update('jax_log_checkpoint_residuals', True)
+jax.config.update("jax_use_shardy_partitioner", True)
 
 def init_training_state(apply_fn, params, tx):
   """Init train state with null opt state for decode."""
