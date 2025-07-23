@@ -188,7 +188,7 @@ def loss_fn(model, params, x):
 #     return train_step
 
 # Scan loop version
-def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardings=None, params_shardings_sharded=None, state_mesh_shardings_w_data=None, peel_first_iter=False):
+def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardings=None, params_shardings_sharded=None, state_mesh_shardings_w_data=None, peel_first_and_last_iter=False):
     def train_step(state, x):
         params = state.params
         opt_state = state.opt_state
@@ -237,15 +237,22 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         # (_, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, init_carry, microbatch_data)
 
         # Peel first iteration to overlap all-gather with compute
-        if peel_first_iter:
+        if peel_first_and_last_iter:
             # Process first microbatch (no all-gather inside)
             first_mb = microbatch_data[0]
-            (params_bf16, first_grads, first_loss), _ = grad_accum_body(init_carry, first_mb)
+            (params_bf16, grads_accum, first_loss), _ = grad_accum_body(init_carry, first_mb)
             
             # Process remaining microbatches with scan (no all-gather inside loop)
-            remaining_mb = microbatch_data[1:]
-            remaining_carry = (params_bf16, first_grads, first_loss)
-            (_, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, remaining_carry, remaining_mb)
+            remaining_mb = microbatch_data[1:-1]
+            remaining_carry = (params_bf16, grads_accum, first_loss)
+            (params_bf16, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, remaining_carry, remaining_mb)
+
+            last_mb = microbatch_data[-1]
+            last_carry = (params_bf16, grads_accum, loss_accum)
+            (_, grads_accum, loss_accum), _ = grad_accum_body(last_carry, last_mb)
+            print('first_mb shape: ', first_mb.shape)
+            print('remaining_mb shape: ', remaining_mb.shape)
+            print('last_mb shape: ', last_mb.shape)
         else:
             # Single microbatch case
             (_, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, init_carry, microbatch_data)
@@ -305,7 +312,7 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         return new_state, loss_accum
     return train_step
 
-def test_gemm_training(sharding_mode="dp", peel_first_iter=False):
+def test_gemm_training(sharding_mode="dp", peel_first_and_last_iter=False):
     # Config
     # batch_size, in_dim, out_dim = 16, 8, 4
     batch_size, in_dim, out_dim, hidden_dim = 128, 4096, 4096, 4096*8
@@ -394,7 +401,7 @@ def test_gemm_training(sharding_mode="dp", peel_first_iter=False):
     print('data_sharding: ', data_sharding)
 
     # Create the train step function
-    train_step_fn = create_train_step(optimizer, model, mesh, grad_accum_steps=ga, params_shardings=params_shardings, params_shardings_sharded=state_mesh_shardings_w_data.params, state_mesh_shardings_w_data=state_mesh_shardings_w_data, peel_first_iter=peel_first_iter)
+    train_step_fn = create_train_step(optimizer, model, mesh, grad_accum_steps=ga, params_shardings=params_shardings, params_shardings_sharded=state_mesh_shardings_w_data.params, state_mesh_shardings_w_data=state_mesh_shardings_w_data, peel_first_and_last_iter=peel_first_and_last_iter)
     
     # JIT the train step function
     p_train_step = jax.jit(
@@ -428,4 +435,4 @@ def test_gemm_training(sharding_mode="dp", peel_first_iter=False):
 if __name__ == "__main__":
     # test_gemm_training("dp")    # Run with data parallel
     # test_gemm_training("fsdp")  # Run with fully sharded data parallel
-    test_gemm_training("zero1", peel_first_iter=False)  # Run with fully sharded data parallel
+    test_gemm_training("zero1", peel_first_and_last_iter=True)  # Run with fully sharded data parallel
