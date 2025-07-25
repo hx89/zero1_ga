@@ -164,8 +164,13 @@ def loss_fn(model, params, x):
     xent = (y_pred_sum - target) ** 2
     xent = lax.with_sharding_constraint(xent, P('dp'))
     total_loss = jnp.sum(xent)
-    loss = total_loss / x.shape[0]
-    return loss
+    total_weights = jnp.sum(target != 0)
+    loss = total_loss / total_weights
+    aux = {
+        "total_loss": total_loss,
+        "total_weights": total_weights,
+    }
+    return loss, aux
 
 # def create_train_step(optimizer, grad_accum_steps=1):
 #     def train_step(params, opt_state, x, y):
@@ -209,19 +214,20 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         x_microbatches = lax.with_sharding_constraint(x_microbatches, P(None, 'dp', None))
 
         def grad_accum_body(carry, microbatch_data):
-            params_bf16, grads_accum, loss_accum = carry
+            params_bf16, grads_accum, total_weights_accum, loss_accum = carry
             x_mb = microbatch_data
             
             # Use params_bf16 for forward pass (no all-gather inside loop)
-            loss, grads = jax.value_and_grad(loss_fn, argnums=1)(model, params_bf16, x_mb)
+            (_, aux), grads = jax.value_and_grad(loss_fn, argnums=1, has_aux=True)(model, params_bf16, x_mb)
             
             if grads_accum is None:
                 grads_accum = grads
             else:
-                grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads_accum, grads)
+                grads_accum = jax.tree_util.tree_map(lambda a, b: a * aux['total_weights'] + b, grads, grads_accum)
             
-            new_loss_accum = loss_accum + loss
-            return (params_bf16, grads_accum, new_loss_accum), None
+            loss_accum = loss_accum + aux['total_loss']
+            total_weights_accum = total_weights_accum + aux['total_weights']
+            return (params_bf16, grads_accum, total_weights_accum, loss_accum), aux
         
         # Initialize carry
         # Unshard params to trigger AG
@@ -236,7 +242,7 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         params_bf16 = jax.tree.map(jax.lax.with_sharding_constraint, params_bf16, params_shardings)
         init_grads = jax.tree_util.tree_map(jnp.zeros_like, params_bf16)
         init_grads = jax.tree.map(jax.lax.with_sharding_constraint, init_grads, params_shardings)
-        init_carry = (params_bf16, init_grads, 0.0)
+        init_carry = (params_bf16, init_grads, 0, 0.0)
         
         # Use scan to accumulate gradients
         microbatch_data = x_microbatches
@@ -246,31 +252,31 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         if peel_first_and_last_iter:
             # Process first microbatch 
             first_mb = microbatch_data[0]
-            (params_bf16, grads_accum, first_loss), _ = grad_accum_body(init_carry, first_mb)
+            (params_bf16, grads_accum, total_weights_accum, loss_accum), _ = grad_accum_body(init_carry, first_mb)
             
             # Process remaining microbatches with scan (no all-gather inside loop)
             remaining_mb = microbatch_data[1:-1]
-            remaining_carry = (params_bf16, grads_accum, first_loss)
-            (params_bf16, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, remaining_carry, remaining_mb)
+            remaining_carry = (params_bf16, grads_accum, total_weights_accum, loss_accum)
+            (params_bf16, grads_accum, total_weights_accum, loss_accum), _ = lax.scan(grad_accum_body, remaining_carry, remaining_mb)
 
             # Process last microbatch 
             last_mb = microbatch_data[-1]
-            last_carry = (params_bf16, grads_accum, loss_accum)
-            (_, grads_accum, loss_accum), _ = grad_accum_body(last_carry, last_mb)
+            last_carry = (params_bf16, grads_accum, total_weights_accum, loss_accum)
+            (_, grads_accum, total_weights_accum, loss_accum), _ = grad_accum_body(last_carry, last_mb)
             print('first_mb shape: ', first_mb.shape)
             print('remaining_mb shape: ', remaining_mb.shape)
             print('last_mb shape: ', last_mb.shape)
         else:
             # Single microbatch case
-            (_, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, init_carry, microbatch_data)
+            (_, grads_accum, total_weights_accum, loss_accum), _ = lax.scan(grad_accum_body, init_carry, microbatch_data)
         
         # Unshard grads_accum 
         grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings)
         # grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings_sharded)
 
         # Average gradients and loss
-        grads_accum = jax.tree_util.tree_map(lambda a: a / grad_accum_steps, grads_accum)
-        loss_accum = loss_accum / grad_accum_steps
+        grads_accum = jax.tree_util.tree_map(lambda a: a / total_weights_accum, grads_accum)
+        loss_accum = loss_accum / total_weights_accum
 
         # grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings_sharded)
 
@@ -442,4 +448,4 @@ def test_gemm_training(sharding_mode="dp", peel_first_and_last_iter=False):
 if __name__ == "__main__":
     # test_gemm_training("dp")    # Run with data parallel
     # test_gemm_training("fsdp")  # Run with fully sharded data parallel
-    test_gemm_training("zero1", peel_first_and_last_iter=True)  # Run with fully sharded data parallel
+    test_gemm_training("zero1", peel_first_and_last_iter=False)  # Run with fully sharded data parallel
