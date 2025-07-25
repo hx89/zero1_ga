@@ -158,9 +158,14 @@ class SimpleLinearModelRemat(nn.Module):
 
 def loss_fn(model, params, x):
     """Loss function using the Flax model"""
-    y_pred = model.apply(params, x)
-    # y_pred = nn.remat(model.apply)(params, x)
-    return jnp.mean((y_pred - x) ** 2)
+    y_pred = model.apply(params, x) # [b, out_dim]
+    y_pred_sum = jnp.sum(y_pred, axis=-1)  # Shape: [b]
+    target = jnp.sum(x, axis=-1)  # Shape: [b]
+    xent = (y_pred_sum - target) ** 2
+    xent = lax.with_sharding_constraint(xent, P('dp'))
+    total_loss = jnp.sum(xent)
+    loss = total_loss / x.shape[0]
+    return loss
 
 # def create_train_step(optimizer, grad_accum_steps=1):
 #     def train_step(params, opt_state, x, y):
@@ -239,7 +244,7 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
 
         # Peel first iteration to overlap all-gather with compute
         if peel_first_and_last_iter:
-            # Process first microbatch (no all-gather inside)
+            # Process first microbatch 
             first_mb = microbatch_data[0]
             (params_bf16, grads_accum, first_loss), _ = grad_accum_body(init_carry, first_mb)
             
@@ -248,6 +253,7 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
             remaining_carry = (params_bf16, grads_accum, first_loss)
             (params_bf16, grads_accum, loss_accum), _ = lax.scan(grad_accum_body, remaining_carry, remaining_mb)
 
+            # Process last microbatch 
             last_mb = microbatch_data[-1]
             last_carry = (params_bf16, grads_accum, loss_accum)
             (_, grads_accum, loss_accum), _ = grad_accum_body(last_carry, last_mb)
