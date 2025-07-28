@@ -133,7 +133,7 @@ class SimpleLinearModelRemat(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        RematDense = nn.remat(nn.Dense)
+        RematDense = nn.remat(nn.Dense, prevent_cse=False)
         # Apply linear transformation
         x = x.astype(self.dtype)
         x = RematDense(
@@ -224,6 +224,7 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
                 grads_accum = grads
             else:
                 grads_accum = jax.tree_util.tree_map(lambda a, b: a * aux['total_weights'] + b, grads, grads_accum)
+                # grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads, grads_accum)
             
             loss_accum = loss_accum + aux['total_loss']
             total_weights_accum = total_weights_accum + aux['total_weights']
