@@ -165,7 +165,8 @@ def loss_fn(model, params, x):
     xent = lax.with_sharding_constraint(xent, P('dp'))
     total_loss = jnp.sum(xent)
     total_weights = jnp.sum(target != 0)
-    loss = total_loss / total_weights
+    # loss = total_loss / total_weights
+    loss = total_loss 
     aux = {
         "total_loss": total_loss,
         "total_weights": total_weights,
@@ -223,8 +224,8 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
             if grads_accum is None:
                 grads_accum = grads
             else:
-                grads_accum = jax.tree_util.tree_map(lambda a, b: a * aux['total_weights'] + b, grads, grads_accum)
-                # grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads, grads_accum)
+                # grads_accum = jax.tree_util.tree_map(lambda a, b: a * aux['total_weights'] + b, grads, grads_accum)
+                grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads, grads_accum)
             
             loss_accum = loss_accum + aux['total_loss']
             total_weights_accum = total_weights_accum + aux['total_weights']
@@ -330,8 +331,8 @@ def test_gemm_training(sharding_mode="dp", peel_first_and_last_iter=False):
     # Config
     # batch_size, in_dim, out_dim = 16, 8, 4
     batch_size, in_dim, out_dim, hidden_dim = 128, 4096, 4096, 4096*8
-    learning_rate = 0.1
-    steps = 5
+    learning_rate = 0.0001
+    steps = 10
     ga = 4
 
     # Create the Flax model
