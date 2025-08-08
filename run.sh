@@ -24,11 +24,12 @@ export XLA_FLAGS="--xla_gpu_enable_nccl_user_buffers=true --xla_dump_hlo_as_text
 
 # mkdir -p /workspace
 
-if [ "$SLURM_PROCID" -eq 0 ]; then
-  nsys profile -s none -o ${NSYS_OUTPUT_FILE} --force-overwrite true --cuda-graph-trace=node python3 -u zero1_ga_test.py
-else
-  python3 -u zero1_ga_test.py
-  # nsys profile -s none -o ${NSYS_OUTPUT_FILE} --force-overwrite true --cuda-graph-trace=node python3 -u zero1_ga_test.py
-fi
+nsys profile -s none -o ${NSYS_OUTPUT_FILE} --force-overwrite true --cuda-graph-trace=node python3 -u zero1_ga_test.py
+# if [ "$SLURM_PROCID" -eq 0 ]; then
+#   nsys profile -s none -o ${NSYS_OUTPUT_FILE} --force-overwrite true --cuda-graph-trace=node python3 -u zero1_ga_test.py
+# else
+#   python3 -u zero1_ga_test.py
+#   # nsys profile -s none -o ${NSYS_OUTPUT_FILE} --force-overwrite true --cuda-graph-trace=node python3 -u zero1_ga_test.py
+# fi
 
 set +x

@@ -124,6 +124,55 @@ class SimpleLinearModel(nn.Module):
         return x
 
 # Flax Linen module for the model with remat
+class SimpleLinearEmbedModelRemat(nn.Module):
+    """Simple linear model with embedding layer"""
+    in_dim: int
+    out_dim: int
+    vocab_size: int
+    dtype: jnp.dtype = jnp.bfloat16
+    weights_dtype: jnp.dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, input_ids):
+        RematDense = nn.remat(nn.Dense, prevent_cse=False)
+        
+        # Create embedding table
+        embedding = self.param(
+            'embedding',
+            nn.with_logical_partitioning(
+                nn.initializers.normal(stddev=0.02),
+                ('vocab', 'embed')
+            ),
+            (self.vocab_size, self.in_dim),
+            self.weights_dtype
+        )
+
+        input_ids = input_ids.astype(jnp.int32)
+        # Look up embeddings and convert to working dtype
+        # x = jnp.take(embedding, input_ids, axis=0)
+        x = jnp.asarray(embedding, self.dtype)[input_ids]
+        x = x.astype(self.dtype)
+        
+        # Apply linear transformations with remat
+        x = RematDense(
+            features=self.out_dim,
+            use_bias=False,
+            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), (None, None)),
+            dtype=self.dtype,
+            param_dtype=self.weights_dtype,
+            name='W1'
+        )(x)
+        x = RematDense(
+            features=self.out_dim,
+            use_bias=False,
+            kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), (None, None)),
+            dtype=self.dtype,
+            param_dtype=self.weights_dtype,
+            name='W2'
+        )(x)
+        return x
+    
+# Flax Linen module for the model with remat
 class SimpleLinearModelRemat(nn.Module):
     """Simple linear model: y = x @ W"""
     in_dim: int
@@ -160,7 +209,8 @@ def loss_fn(model, params, x):
     """Loss function using the Flax model"""
     y_pred = model.apply(params, x) # [b, out_dim]
     y_pred_sum = jnp.sum(y_pred, axis=-1)  # Shape: [b]
-    target = jnp.sum(x, axis=-1)  # Shape: [b]
+    # target = jnp.sum(x, axis=-1)  # Shape: [b]
+    target = y_pred_sum  # Shape: [b]
     xent = (y_pred_sum - target) ** 2
     xent = lax.with_sharding_constraint(xent, P('dp'))
     total_loss = jnp.sum(xent)
@@ -280,49 +330,7 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         grads_accum = jax.tree_util.tree_map(lambda a: a / total_weights_accum, grads_accum)
         loss_accum = loss_accum / total_weights_accum
 
-        # grads_accum = jax.tree.map(jax.lax.with_sharding_constraint, grads_accum, params_shardings_sharded)
-
-        # def process_gradients(grads_accum):
-        #     averaged = jax.tree_util.tree_map(lambda a: a / grad_accum_steps, grads_accum)
-        #     return averaged
-        # # Convert NamedSharding to PartitionSpec for shard_map
-        # in_pspecs = named_sharding_to_partition_spec(params_shardings)
-        # out_pspecs = named_sharding_to_partition_spec(params_shardings_sharded)
-        # print('params_shardings: ', params_shardings)
-        # print('params_shardings_sharded: ', params_shardings_sharded)
-        # print('in_pspecs: ', in_pspecs)
-        # print('out_pspecs: ', out_pspecs)
-        # print('grads_accum structure: ', jax.tree_util.tree_structure(grads_accum))
-        # print('in_pspecs structure: ', jax.tree_util.tree_structure(in_pspecs))
-        # from jax.tree_util import tree_map
-        # print("grads_accum types:")
-        # print(tree_map(lambda x: type(x), grads_accum))
-        # print("in_specs types:")
-        # print(tree_map(lambda x: type(x), in_pspecs))
-        # grads_accum = jax.shard_map(process_gradients, mesh=mesh, in_specs=in_pspecs, out_specs=out_pspecs)(grads_accum)
-
-        # updates, opt_state = optimizer.update(grads_accum, opt_state, params)
-        # new_params = optax.apply_updates(params, updates)
-        # return new_params, opt_state, loss_accum
-
         new_state = state.apply_gradients(grads=grads_accum)
-
-        # # Wrap state.apply_gradients in shard_map
-        # def apply_gradients_sharded(state, grads):
-        #     return state.apply_gradients(grads=grads)
-        
-        # # Convert NamedSharding to PartitionSpec for shard_map
-        # state_pspecs = named_sharding_to_partition_spec(state_mesh_shardings_w_data)
-        # grads_pspecs = named_sharding_to_partition_spec(params_shardings_sharded)
-        # print('state_pspecs: ', state_pspecs)
-        # print('grads_pspecs: ', grads_pspecs)
-
-        # new_state = jax.shard_map(
-        #     apply_gradients_sharded,
-        #     mesh=mesh,
-        #     in_specs=(state_pspecs, grads_pspecs),  # state, grads_accum
-        #     out_specs=state_pspecs,  # new_state
-        # )(state, grads_accum)
 
         return new_state, loss_accum
     return train_step
@@ -330,32 +338,40 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
 def test_gemm_training(sharding_mode="dp", peel_first_and_last_iter=False):
     # Config
     # batch_size, in_dim, out_dim = 16, 8, 4
-    batch_size, in_dim, out_dim, hidden_dim = 128, 4096, 4096, 4096*8
+    batch_size = 128
+    in_dim = 4096  # embedding dimension
+    out_dim = 4096
+    hidden_dim = 4096*8
+    vocab_size = 32000  # vocabulary size for embeddings
     learning_rate = 0.0001
     steps = 10
     ga = 4
 
     # Create the Flax model
     # model = SimpleLinearModel(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
-    model = SimpleLinearModelRemat(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
+    # model = SimpleLinearModelRemat(in_dim=in_dim, out_dim=out_dim, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
+    model = SimpleLinearEmbedModelRemat(in_dim=in_dim, out_dim=out_dim, vocab_size=vocab_size, dtype=jnp.bfloat16, weights_dtype=jnp.float32)
     # Create config-like object for logical axis rules
     class Config:
         def __init__(self):
             self.logical_axis_rules = [
                 ('batch', 'dp'),
                 ('embed', None),
+                ('vocab', None),  # Add vocab axis for embedding table
                 ('mlp', None),
                 ('heads', None),
                 ('kv', None),
             ]
-            self.input_data_sharding_logical_axes = ('batch', 'embed')
+            # self.input_data_sharding_logical_axes = ('batch', 'embed')
+            self.input_data_sharding_logical_axes = ('batch',)  # Input is now just token IDs
     config = Config()
 
-    # Data
+    # Data - generate random token IDs
     key = random.PRNGKey(0)
-    target_params = 0.5
-    x = random.normal(key, (batch_size, in_dim), dtype=jnp.bfloat16)
-    print("x shape: ", x.shape)
+    # x = random.normal(key, (batch_size, in_dim), dtype=jnp.bfloat16)
+    # print("x shape: ", x.shape)
+    input_ids = random.randint(key, (batch_size,), 0, vocab_size)
+    print("input_ids shape: ", input_ids.shape)
 
     # Optimizer
     optimizer = optax.adamw(learning_rate, b1=0.9, b2=0.95, eps=1e-8, eps_root=1e-16, weight_decay=0.1, mu_dtype=jnp.float32)
@@ -439,7 +455,8 @@ def test_gemm_training(sharding_mode="dp", peel_first_and_last_iter=False):
     state = unbox_logicallypartioned(state)
 
     for i in range(steps):
-        example_batch = jax.lax.with_sharding_constraint(x, data_sharding)
+        # example_batch = jax.lax.with_sharding_constraint(x, data_sharding)
+        example_batch = jax.lax.with_sharding_constraint(input_ids, data_sharding)
         with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
           # Apply sharding constraint to state to match expected sharding
           state = jax.lax.with_sharding_constraint(state, state_mesh_shardings_w_data)
