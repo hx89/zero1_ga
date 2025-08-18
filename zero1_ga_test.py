@@ -11,10 +11,12 @@ import flax
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
+import jax.profiler
+import argparse
 # from MaxText.layers import linears
 
 jax.config.update('jax_log_checkpoint_residuals', True)
-jax.config.update("jax_use_shardy_partitioner", True)
+jax.config.update("jax_use_shardy_partitioner", False)
 
 def init_training_state(apply_fn, params, tx):
   """Init train state with null opt state for decode."""
@@ -60,6 +62,11 @@ def add_data_to_sharding(mesh, path, aval, sharding):
 
   if 'data' in jax.tree.leaves(pspec):
     return sharding
+
+  # # Check if this is the embedding parameter - if so, don't add dp axis
+  # path_str = jax.tree_util.keystr(path)
+  # if 'embedding' in path_str:
+  #   return sharding
 
   for idx, (size, partition) in enumerate(zip(sharded_shape, pspec)):
     if partition is None:
@@ -268,14 +275,18 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
             params_bf16, grads_accum, total_weights_accum, loss_accum = carry
             x_mb = microbatch_data
             
-            # Use params_bf16 for forward pass (no all-gather inside loop)
-            (_, aux), grads = jax.value_and_grad(loss_fn, argnums=1, has_aux=True)(model, params_bf16, x_mb)
+            # Profile forward pass
+            with jax.profiler.TraceAnnotation("forward_pass"):
+                # Use params_bf16 for forward pass (no all-gather inside loop)
+                (_, aux), grads = jax.value_and_grad(loss_fn, argnums=1, has_aux=True)(model, params_bf16, x_mb)
             
-            if grads_accum is None:
-                grads_accum = grads
-            else:
-                # grads_accum = jax.tree_util.tree_map(lambda a, b: a * aux['total_weights'] + b, grads, grads_accum)
-                grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads, grads_accum)
+            # Profile gradient accumulation
+            with jax.profiler.TraceAnnotation("grad_accum"):
+                if grads_accum is None:
+                    grads_accum = grads
+                else:
+                    # grads_accum = jax.tree_util.tree_map(lambda a, b: a * aux['total_weights'] + b, grads, grads_accum)
+                    grads_accum = jax.tree_util.tree_map(lambda a, b: a + b, grads, grads_accum)
             
             loss_accum = loss_accum + aux['total_loss']
             total_weights_accum = total_weights_accum + aux['total_weights']
@@ -335,7 +346,7 @@ def create_train_step(optimizer, model, mesh, grad_accum_steps=1, params_shardin
         return new_state, loss_accum
     return train_step
 
-def test_gemm_training(sharding_mode="dp", peel_first_and_last_iter=False):
+def test_gemm_training(sharding_mode="dp", peel_first_and_last_iter=False, profiler=None):
     # Config
     # batch_size, in_dim, out_dim = 16, 8, 4
     batch_size = 128
@@ -405,7 +416,9 @@ def test_gemm_training(sharding_mode="dp", peel_first_and_last_iter=False):
             abstract_state = jax.eval_shape(init_state_partial)
         state_logical_annotations = nn.get_partition_spec(abstract_state)
         state_mesh_shardings = nn.logical_to_mesh_sharding(state_logical_annotations, mesh, config.logical_axis_rules)
+        print('abstract_state: ', abstract_state)
         print('state_logical_annotations: ', state_logical_annotations)
+        print('state_mesh_shardings: ', state_mesh_shardings)
 
         # Create new state_mesh_shardings with data sharding added to opt_state
         state_mesh_shardings_w_data = jax.tree_util.tree_map(lambda x: x, state_mesh_shardings)
@@ -416,6 +429,7 @@ def test_gemm_training(sharding_mode="dp", peel_first_and_last_iter=False):
                 state_mesh_shardings_w_data.opt_state
             )
         )
+        print('state_mesh_shardings_w_data: ', state_mesh_shardings_w_data)
         # Shard params to be the same as the opt_state, keep the orginal params shardings in params_shardings
         params_shardings, state_mesh_shardings_w_data = maybe_update_params_sharding_with_opt(state_mesh_shardings_w_data)
     else:
@@ -454,17 +468,55 @@ def test_gemm_training(sharding_mode="dp", peel_first_and_last_iter=False):
     )(key)
     state = unbox_logicallypartioned(state)
 
+    # Start profiling based on profiler argument
+    if profiler == "nsys":
+        print("Using Nsight Systems profiler - JAX profiler disabled")
+        use_jax_profiler = False
+    elif profiler == "xplane":
+        print("Using JAX profiler")
+        jax.profiler.start_trace("./tensorboard")
+        use_jax_profiler = True
+    else:
+        print("No profiler specified")
+        use_jax_profiler = False
+    
     for i in range(steps):
         # example_batch = jax.lax.with_sharding_constraint(x, data_sharding)
         example_batch = jax.lax.with_sharding_constraint(input_ids, data_sharding)
         with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
           # Apply sharding constraint to state to match expected sharding
           state = jax.lax.with_sharding_constraint(state, state_mesh_shardings_w_data)
-          state, loss = p_train_step(state, example_batch)
+          
+          if use_jax_profiler:
+              with jax.profiler.TraceAnnotation(f"training_step_{i}"):
+                  state, loss = p_train_step(state, example_batch)
+          else:
+              state, loss = p_train_step(state, example_batch)
+          
           loss_float = float(loss)
           print(f"[{sharding_mode}] Step {i}, Loss: {loss_float:.4f}")
+    
+    # Stop profiling if not already stopped
+    if use_jax_profiler:
+        try:
+            jax.profiler.stop_trace()
+        except:
+            pass
 
 if __name__ == "__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Zero1 GA Training with Profiling')
+    parser.add_argument('--profiler', type=str, default=None, 
+                       choices=['xplane', 'nsys', None],
+                       help='Profiler to use: xplane, nsys, or None')
+    parser.add_argument('--sharding', type=str, default='zero1',
+                       choices=['dp', 'fsdp', 'zero1'],
+                       help='Sharding mode: dp, fsdp, or zero1')
+    parser.add_argument('--peel', action='store_true',
+                       help='Peel first and last iteration for overlap')
+    
+    args = parser.parse_args()
+    
     # test_gemm_training("dp")    # Run with data parallel
     # test_gemm_training("fsdp")  # Run with fully sharded data parallel
-    test_gemm_training("zero1", peel_first_and_last_iter=False)  # Run with fully sharded data parallel
+    test_gemm_training(args.sharding, peel_first_and_last_iter=args.peel, profiler=args.profiler)

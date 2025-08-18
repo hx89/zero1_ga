@@ -1,7 +1,8 @@
 #! /bin/bash
 set -x
 
-LOG_DIR=${1:-'./'}
+PROFILER=${1:-'nsys'}
+LOG_DIR=${2:-'./'}
 
 NSYS_OUTPUT_FILE="${LOG_DIR}/output-nsys-profile"
 XLA_DUMP_DIR="${LOG_DIR}/xla_dump"
@@ -24,7 +25,12 @@ export XLA_FLAGS="--xla_gpu_enable_nccl_user_buffers=true --xla_dump_hlo_as_text
 
 # mkdir -p /workspace
 
-nsys profile -s none -o ${NSYS_OUTPUT_FILE} --force-overwrite true --cuda-graph-trace=node python3 -u zero1_ga_test.py
+if [ "$PROFILER" == "nsys" ]; then
+  nsys profile -s none -o ${NSYS_OUTPUT_FILE} --force-overwrite true --cuda-graph-trace=node python3 -u zero1_ga_test.py --profiler nsys
+else
+  python3 -u zero1_ga_test.py --profiler xplane
+fi
+
 # if [ "$SLURM_PROCID" -eq 0 ]; then
 #   nsys profile -s none -o ${NSYS_OUTPUT_FILE} --force-overwrite true --cuda-graph-trace=node python3 -u zero1_ga_test.py
 # else
